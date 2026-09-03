@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QFile, QIODevice, QObject, Qt, QThread, Signal
-from PySide6.QtGui import QColor, QPalette, QPixmap
+from PySide6.QtGui import QColor, QIcon, QPalette, QPixmap
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
@@ -532,7 +532,24 @@ class _PortalWindowController(QObject):
 
 
 def main() -> None:
+    # Portal is spawned as plain pythonw.exe by UkoreHubLauncher.exe (see
+    # updater.py's _launch), so without an explicit window icon it shows
+    # Windows' generic Python icon in the taskbar/title bar.
+    # SetCurrentProcessExplicitAppUserModelID keeps Windows from grouping
+    # this taskbar button/pin under pythonw.exe's own identity, which
+    # otherwise overrides the window icon in some taskbar/Alt-Tab contexts
+    # even after setWindowIcon.
+    if sys.platform == "win32":
+        import ctypes
+
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("UkoreHub.Portal")
+        except OSError:
+            pass
     app = QApplication(sys.argv)
+    icon_path = PORTAL_ROOT / "assets" / "icon.ico"
+    if icon_path.exists():
+        app.setWindowIcon(QIcon(str(icon_path)))
     _apply_dark_theme(app)
 
     loader = QUiLoader()
