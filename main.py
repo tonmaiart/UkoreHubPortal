@@ -53,6 +53,7 @@ from pathlib import Path
 
 from PySide6.QtCore import QFile, QIODevice, QObject, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QIcon, QPalette, QPixmap
+from PySide6.QtNetwork import QLocalSocket
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
@@ -112,6 +113,29 @@ _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 
 # after window.showMaximized() — see that file's own comment and this
 # module's docstring.
 _APP_READY_MARKER = "UKOREHUB_APP_WINDOW_READY"
+
+# Must match app/launcher.py's own SINGLETON_SERVER_NAME exactly — see
+# _raise_existing_app_instance below.
+_APP_SINGLETON_SERVER_NAME = "UkoreHubApp"
+
+
+def _raise_existing_app_instance() -> bool:
+    """True if a running app/launcher.py instance answered and was told to
+    raise its own window — main() should return immediately in that case,
+    without ever spawning a second app/launcher.py. False means no
+    instance is currently listening, so it's safe to proceed as normal.
+
+    A short, synchronous connect attempt rather than anything event-loop
+    driven — this runs before Portal's own window even exists, so there's
+    nothing yet for an async callback to hand control back to."""
+    socket = QLocalSocket()
+    socket.connectToServer(_APP_SINGLETON_SERVER_NAME)
+    if not socket.waitForConnected(500):
+        return False
+    socket.write(b"raise")
+    socket.waitForBytesWritten(500)
+    socket.disconnectFromServer()
+    return True
 
 
 def _is_dev_checkout() -> bool:
@@ -532,6 +556,17 @@ class _PortalWindowController(QObject):
 
 
 def main() -> None:
+    app = QApplication(sys.argv)
+
+    # App is meant to run as a single session — if one is already up
+    # (whether Portal launched it earlier, or it's still starting up right
+    # now), raise its window and stop here instead of spawning a second
+    # one. Checked first, before any of Portal's own UI/preflight work
+    # below, so a repeat double-click of UkoreHubLauncher.exe while
+    # UkoreHub is already open never even flashes Portal's loading screen.
+    if _raise_existing_app_instance():
+        return
+
     # Portal is spawned as plain pythonw.exe by UkoreHubLauncher.exe (see
     # updater.py's _launch), so without an explicit window icon it shows
     # Windows' generic Python icon in the taskbar/title bar.
@@ -546,7 +581,6 @@ def main() -> None:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("UkoreHub.Portal")
         except OSError:
             pass
-    app = QApplication(sys.argv)
     icon_path = PORTAL_ROOT / "assets" / "icon.ico"
     if icon_path.exists():
         app.setWindowIcon(QIcon(str(icon_path)))
