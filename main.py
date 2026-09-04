@@ -43,12 +43,13 @@ yet — those are later slices layered onto this same entry point.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QFile, QIODevice, QObject, Qt, QThread, Signal
@@ -107,6 +108,14 @@ LAUNCHER_CONFIG_FILENAME = "launcher_config.json"
 # actually set one there.
 DEFAULT_GITHUB_CLIENT_ID = "Ov23liCPza6KiJ7MWZbc"
 
+# How long a previously-confirmed token is trusted without re-checking it
+# against GitHub — see _token_recently_validated. Without this, every
+# ordinary launch paid a real network round-trip just to reconfirm a token
+# that almost never actually changes between launches. A revoked/expired
+# token is still caught the moment this window lapses, or by any GitHub
+# API call the running app itself makes in the meantime.
+TOKEN_REVALIDATE_INTERVAL = timedelta(hours=12)
+
 _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 # Must match the literal app/launcher.py's _reveal_window() prints right
@@ -119,6 +128,24 @@ _APP_READY_MARKER = "UKOREHUB_APP_WINDOW_READY"
 _APP_SINGLETON_SERVER_NAME = "UkoreHubApp"
 
 
+def _token_recently_validated(local_config_store) -> bool:
+    """True when github_login_at (set on both an actual login and every
+    successful fetch_username revalidation — see _PreflightWorker.run) is
+    still within TOKEN_REVALIDATE_INTERVAL, so the caller can skip another
+    GitHub API round-trip this launch. Any unparsable/missing timestamp is
+    treated as "needs revalidation" rather than trusted."""
+    login_at = local_config_store.github_login_at
+    if not login_at:
+        return False
+    try:
+        checked_at = datetime.fromisoformat(login_at)
+    except ValueError:
+        return False
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - checked_at < TOKEN_REVALIDATE_INTERVAL
+
+
 def _raise_existing_app_instance() -> bool:
     """True if a running app/launcher.py instance answered and was told to
     raise its own window — main() should return immediately in that case,
@@ -127,10 +154,14 @@ def _raise_existing_app_instance() -> bool:
 
     A short, synchronous connect attempt rather than anything event-loop
     driven — this runs before Portal's own window even exists, so there's
-    nothing yet for an async callback to hand control back to."""
+    nothing yet for an async callback to hand control back to. 150ms
+    rather than something more generous: a local named-pipe connect
+    resolves near-instantly whether or not a server is listening, so this
+    is pure margin, not a real network timeout — and it's paid on every
+    ordinary cold start (the common case, where nothing is listening yet)."""
     socket = QLocalSocket()
     socket.connectToServer(_APP_SINGLETON_SERVER_NAME)
-    if not socket.waitForConnected(500):
+    if not socket.waitForConnected(150):
         return False
     socket.write(b"raise")
     socket.waitForBytesWritten(500)
@@ -217,9 +248,40 @@ def _ensure_app_up_to_date() -> None:
     ensure_up_to_date(APP_ROOT, APP_REMOTE_URL, APP_BRANCH)
 
 
+def _requirements_marker_path(requirements_path: Path) -> Path:
+    return requirements_path.with_name(requirements_path.name + ".installed-hash")
+
+
+def _requirements_up_to_date(requirements_path: Path) -> bool:
+    """Same reasoning/behavior as updater.py's own copy of this pair — kept
+    duplicated rather than shared since main.py/updater.py can't import
+    each other (separate repos/processes). Skips the pip subprocess when
+    requirements.txt's content hash matches the marker left by the last
+    successful install; a release that changes requirements.txt changes
+    the hash and forces a real reinstall."""
+    marker_path = _requirements_marker_path(requirements_path)
+    if not marker_path.exists():
+        return False
+    try:
+        digest = hashlib.sha256(requirements_path.read_bytes()).hexdigest()
+        return marker_path.read_text(encoding="utf-8").strip() == digest
+    except OSError:
+        return False
+
+
+def _mark_requirements_installed(requirements_path: Path) -> None:
+    try:
+        digest = hashlib.sha256(requirements_path.read_bytes()).hexdigest()
+        _requirements_marker_path(requirements_path).write_text(digest, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def _ensure_app_dependencies() -> None:
     requirements_path = APP_ROOT / "requirements.txt"
     if not requirements_path.exists():
+        return
+    if _requirements_up_to_date(requirements_path):
         return
     subprocess.run(
         [
@@ -234,6 +296,7 @@ def _ensure_app_dependencies() -> None:
         ],
         check=True,
     )
+    _mark_requirements_installed(requirements_path)
 
 
 def _apply_dark_theme(app) -> None:
@@ -397,7 +460,7 @@ class _PreflightWorker(QObject):
         from core.github import auth as github_auth
 
         token = self._token_store.load_token()
-        if token:
+        if token and not _token_recently_validated(self._local_config_store):
             try:
                 github_auth.fetch_username(token)
             except GitHubAuthError:
@@ -408,6 +471,11 @@ class _PreflightWorker(QObject):
                 self._local_config_store.set_github_username(None)
                 self._local_config_store.set_github_login_at(None)
                 token = None
+            else:
+                # Refresh the timestamp so the next TOKEN_REVALIDATE_INTERVAL
+                # window starts counting from this confirmed check, not just
+                # from the original login.
+                self._local_config_store.set_github_login_at(datetime.now(timezone.utc).isoformat())
 
         if token:
             self.status.emit("Ready.")
