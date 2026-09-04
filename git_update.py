@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Callable
 
 _NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
@@ -61,12 +62,18 @@ def is_git_repo(repo_root: Path) -> bool:
     return (repo_root / ".git").exists()
 
 
-def bootstrap_git_repo(repo_root: Path, remote_url: str, branch: str) -> None:
+def bootstrap_git_repo(
+    repo_root: Path, remote_url: str, branch: str, on_status: Callable[[str], None] | None = None
+) -> None:
     """Turns a plain folder into a real git working tree tracking
     remote_url/branch, in place — same as updater.py's own version."""
+    status = on_status or (lambda _msg: None)
+    status("Setting up UkoreHub repository...")
     _run_git(["init"], cwd=repo_root)
     _run_git(["remote", "add", "origin", remote_url], cwd=repo_root)
+    status("Downloading UkoreHub (first run)...")
     _run_git(["fetch", "origin", branch], cwd=repo_root)
+    status("Checking out UkoreHub...")
     try:
         _run_git(["checkout", "-B", branch, "--track", f"origin/{branch}"], cwd=repo_root)
     except UpdateError:
@@ -83,18 +90,25 @@ def _clean_untracked(repo_root: Path) -> None:
         pass
 
 
-def ensure_up_to_date(repo_root: Path, remote_url: str, branch: str) -> None:
+def ensure_up_to_date(
+    repo_root: Path, remote_url: str, branch: str, on_status: Callable[[str], None] | None = None
+) -> None:
     """Forces repo_root to exactly match remote_url/branch's upstream —
     same fetch + clean -fd + reset --hard approach as updater.py's own
     ensure_up_to_date, for the same reason: nothing in app_root is worth a
     merge conflict over (per-machine files live outside it entirely, see
     root CLAUDE.md's "Program folder stays program-only")."""
+    status = on_status or (lambda _msg: None)
     if not is_git_repo(repo_root):
-        bootstrap_git_repo(repo_root, remote_url, branch)
+        bootstrap_git_repo(repo_root, remote_url, branch, on_status)
         return
+    status("Checking for app updates...")
     _run_git(["fetch"], cwd=repo_root)
     local_head = _run_git(["rev-parse", "HEAD"], cwd=repo_root)
     upstream_head = _run_git(["rev-parse", "@{u}"], cwd=repo_root)
     if local_head != upstream_head:
+        status("Downloading app updates...")
         _clean_untracked(repo_root)
         _run_git(["reset", "--hard", upstream_head], cwd=repo_root)
+    else:
+        status("UkoreHub is up to date.")

@@ -123,6 +123,13 @@ _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 
 # module's docstring.
 _APP_READY_MARKER = "UKOREHUB_APP_WINDOW_READY"
 
+# Must match app/launcher.py's own _APP_STATUS_PREFIX exactly — each line
+# app/launcher.py prints with this prefix during its own slow pre-window
+# startup work (cloud sync, plugin discovery, ...) becomes a status label
+# update here instead of leaving "Starting UkoreHub..." showing the whole
+# time — see _AppLaunchWaiter.
+_APP_STATUS_PREFIX = "UKOREHUB_APP_STATUS:"
+
 # Must match app/launcher.py's own SINGLETON_SERVER_NAME exactly — see
 # _raise_existing_app_instance below.
 _APP_SINGLETON_SERVER_NAME = "UkoreHubApp"
@@ -239,13 +246,13 @@ def _resolve_dirs(parent) -> tuple[Path, Path, Path]:
     return workspace_root / "cache", workspace_root / "storage", workspace_root / "data"
 
 
-def _ensure_app_up_to_date() -> None:
+def _ensure_app_up_to_date(on_status=None) -> None:
     if _is_dev_checkout():
         return
     from git_update import ensure_up_to_date
 
     APP_ROOT.mkdir(parents=True, exist_ok=True)
-    ensure_up_to_date(APP_ROOT, APP_REMOTE_URL, APP_BRANCH)
+    ensure_up_to_date(APP_ROOT, APP_REMOTE_URL, APP_BRANCH, on_status)
 
 
 def _requirements_marker_path(requirements_path: Path) -> Path:
@@ -277,12 +284,15 @@ def _mark_requirements_installed(requirements_path: Path) -> None:
         pass
 
 
-def _ensure_app_dependencies() -> None:
+def _ensure_app_dependencies(on_status=None) -> None:
+    status = on_status or (lambda _msg: None)
     requirements_path = APP_ROOT / "requirements.txt"
     if not requirements_path.exists():
         return
     if _requirements_up_to_date(requirements_path):
+        status("Python dependencies already up to date.")
         return
+    status("Installing required Python packages (this may take a few minutes)...")
     subprocess.run(
         [
             _console_python(),
@@ -426,9 +436,9 @@ class _PreflightWorker(QObject):
         self._system_config_store = system_config_store
 
     def run(self) -> None:
-        self.status.emit("Checking for updates...")
+        self.status.emit("Checking app repository...")
         try:
-            _ensure_app_up_to_date()
+            _ensure_app_up_to_date(self.status.emit)
         except Exception as exc:
             self.warning.emit(
                 "Update Failed",
@@ -444,9 +454,9 @@ class _PreflightWorker(QObject):
                 "may not sync correctly.",
             )
 
-        self.status.emit("Installing required packages...")
+        self.status.emit("Checking Python dependencies...")
         try:
-            _ensure_app_dependencies()
+            _ensure_app_dependencies(self.status.emit)
         except subprocess.CalledProcessError as exc:
             self.failed.emit(
                 f"Failed to install required Python packages:\n{exc}\n\n"
@@ -455,12 +465,13 @@ class _PreflightWorker(QObject):
             )
             return
 
-        self.status.emit("Checking sign-in...")
+        self.status.emit("Checking GitHub sign-in...")
         from core.exceptions import GitHubAuthError
         from core.github import auth as github_auth
 
         token = self._token_store.load_token()
         if token and not _token_recently_validated(self._local_config_store):
+            self.status.emit("Validating saved GitHub session...")
             try:
                 github_auth.fetch_username(token)
             except GitHubAuthError:
@@ -478,7 +489,7 @@ class _PreflightWorker(QObject):
                 self._local_config_store.set_github_login_at(datetime.now(timezone.utc).isoformat())
 
         if token:
-            self.status.emit("Ready.")
+            self.status.emit("Signed in. Ready.")
             self.ready.emit()
             return
 
@@ -497,6 +508,7 @@ class _AppLaunchWaiter(QObject):
     waiting forever."""
 
     ready = Signal()
+    status = Signal(str)
     failed = Signal(str)
 
     def __init__(self, proc: subprocess.Popen):
@@ -509,6 +521,8 @@ class _AppLaunchWaiter(QObject):
                 if _APP_READY_MARKER in line:
                     self.ready.emit()
                     return
+                if line.startswith(_APP_STATUS_PREFIX):
+                    self.status.emit(line[len(_APP_STATUS_PREFIX):].strip())
         self.failed.emit("app/launcher.py exited before its window appeared")
 
 
@@ -563,6 +577,7 @@ class _PortalWindowController(QObject):
         self._wait_worker.moveToThread(self._wait_thread)
         self._wait_thread.started.connect(self._wait_worker.run)
         self._wait_worker.ready.connect(self._on_app_launched)
+        self._wait_worker.status.connect(self.on_status)
         self._wait_worker.failed.connect(self._on_app_launch_failed)
         self._wait_thread.start()
 
@@ -664,7 +679,7 @@ def main() -> None:
 
     status_label = window.findChild(QLabel, "label_loading_info")
     progress_bar = window.findChild(QProgressBar, "progressBar_loading")
-    status_label.setText("Preparing...")
+    status_label.setText("Setting up workspace...")
     progress_bar.setRange(0, 0)  # indeterminate while preflight runs
     window.show()
 
