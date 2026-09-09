@@ -59,18 +59,39 @@ def _run_git(args: list[str], cwd: Path) -> str:
 
 
 def is_git_repo(repo_root: Path) -> bool:
-    return (repo_root / ".git").exists()
+    """True only for a working checkout with an actual commit checked out —
+    not just a `.git` directory. See updater.py's own version of this
+    function for why (a `.git` dir can be left over from a bootstrap that
+    failed partway, with no commits yet)."""
+    if not (repo_root / ".git").exists():
+        return False
+    result = subprocess.run(
+        [shutil.which("git") or "git", "rev-parse", "--verify", "-q", "HEAD"],
+        cwd=str(repo_root),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        env=_non_interactive_env(),
+        creationflags=_NO_WINDOW_FLAGS,
+    )
+    return result.returncode == 0
 
 
 def bootstrap_git_repo(
     repo_root: Path, remote_url: str, branch: str, on_status: Callable[[str], None] | None = None
 ) -> None:
     """Turns a plain folder into a real git working tree tracking
-    remote_url/branch, in place — same as updater.py's own version."""
+    remote_url/branch, in place — same as updater.py's own version,
+    including re-entrancy against a `.git` dir left over from an earlier
+    failed attempt (see is_git_repo)."""
     status = on_status or (lambda _msg: None)
     status("Setting up UkoreHub repository...")
     _run_git(["init"], cwd=repo_root)
-    _run_git(["remote", "add", "origin", remote_url], cwd=repo_root)
+    existing_remotes = _run_git(["remote"], cwd=repo_root).split()
+    if "origin" in existing_remotes:
+        _run_git(["remote", "set-url", "origin", remote_url], cwd=repo_root)
+    else:
+        _run_git(["remote", "add", "origin", remote_url], cwd=repo_root)
     status("Downloading UkoreHub (first run)...")
     _run_git(["fetch", "origin", branch], cwd=repo_root)
     status("Checking out UkoreHub...")
