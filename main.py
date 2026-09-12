@@ -376,6 +376,13 @@ def _ensure_app_dependencies(on_status=None) -> None:
             str(requirements_path),
             "--disable-pip-version-check",
             "--quiet",
+            # Same reasoning as updater.py's own ensure_dependencies_installed
+            # — pip's default --timeout (15s) is a per-read stall timeout,
+            # not a total-download budget, and app/requirements.txt pulls in
+            # PySide6 (tens of MB) — a slow connection can trip that well
+            # before the download is actually stuck.
+            "--timeout",
+            "60",
         ],
         check=True,
     )
