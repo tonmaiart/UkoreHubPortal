@@ -40,11 +40,21 @@ genuinely needs a human click — GitHub sign-in (see on_login_needed) —
 since popping a device-flow dialog and a browser tab with no warning
 would be startling. No project dashboard or "Back to Portal" round-trip
 yet — those are later slices layered onto this same entry point.
+
+Both Portal and app/launcher.py run under pythonw (no console/stdout a
+person can ever see), so main() calls _setup_logging() first thing to
+write every status line, warning, and uncaught exception to a per-launch
+file under REPO_ROOT/logs — a sibling of app/ and portal/, not inside
+either (see _resolve_log_dir) — including app/launcher.py's own
+stdout/stderr, merged and tee'd line-by-line in _AppLaunchWaiter.run().
+Otherwise a crash before or during app/launcher.py startup leaves no
+trace anywhere for the artist to report back.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -133,6 +143,17 @@ _APP_STATUS_PREFIX = "UKOREHUB_APP_STATUS:"
 # Must match app/launcher.py's own SINGLETON_SERVER_NAME exactly — see
 # _raise_existing_app_instance below.
 _APP_SINGLETON_SERVER_NAME = "UkoreHubApp"
+
+# One file per Portal launch, named so the most recent is always last when
+# sorted alphabetically/by mtime — the whole point is "what's the latest
+# log" being an obvious, findable answer when Portal or the app it spawns
+# died with nobody watching a console (both run under pythonw — see
+# _spawn_launcher and main()).
+_LOG_FILENAME_FORMAT = "session_%Y%m%d_%H%M%S.log"
+
+# Kept small on purpose — this folder gets a new file on every single
+# launch, so with no cap it grows forever on a machine nobody ever cleans.
+_MAX_LOG_FILES = 20
 
 
 def _token_recently_validated(local_config_store) -> bool:
@@ -230,6 +251,58 @@ def _ensure_workspace_root(parent) -> Path:
     workspace_dir = chosen if chosen else str(REPO_ROOT / "workspace")
     _save_workspace_root(workspace_dir)
     return Path(workspace_dir)
+
+
+def _resolve_log_dir() -> Path:
+    """Deliberately sibling of app/ and portal/ (REPO_ROOT/logs), not under
+    workspace_root like cache/storage/data — those hold per-machine
+    user/project data the artist picked a drive for, while logs are a
+    small, install-local diagnostic trail that belongs next to the two
+    program folders it's actually about. Also means no dependency on
+    launcher_config.json/_ensure_workspace_root, so logging can start as
+    the very first thing in main(), before QApplication or the first-run
+    workspace picker exist — nothing before it in the startup sequence."""
+    override = os.environ.get("UKOREHUB_LOG_DIR")
+    if override:
+        return Path(override)
+    return REPO_ROOT / "logs"
+
+
+def _prune_old_logs(log_dir: Path) -> None:
+    existing = sorted(log_dir.glob("session_*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in existing[_MAX_LOG_FILES - 1:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def _setup_logging() -> Path:
+    """Called first thing in main(), before anything that could fail —
+    the whole point is a log file existing even if Portal dies during its
+    own preflight work, not just once the app it spawns is up. Also
+    installs a sys.excepthook: Portal normally runs under pythonw with no
+    console/stderr at all (see module docstring), so an uncaught exception
+    would otherwise vanish completely instead of even reaching a terminal
+    the artist could screenshot."""
+    log_dir = _resolve_log_dir()
+    log_dir.mkdir(parents=True, exist_ok=True)
+    _prune_old_logs(log_dir)
+
+    log_path = log_dir / datetime.now().strftime(_LOG_FILENAME_FORMAT)
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("[%(asctime)s] [%(name)s] [%(levelname)s] %(message)s", "%H:%M:%S"))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(handler)
+
+    def _log_uncaught(exc_type, exc_value, exc_tb) -> None:
+        logging.getLogger("Portal").critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _log_uncaught
+    return log_path
 
 
 def _resolve_dirs(parent) -> tuple[Path, Path, Path]:
@@ -397,7 +470,11 @@ def _spawn_launcher(cache_dir: Path, storage_dir: Path, data_dir: Path) -> subpr
     # left to inherit/discard) so _AppLaunchWaiter can watch for
     # _APP_READY_MARKER — that works fine even under pythonw, since a pipe
     # Popen creates itself is independent of whether the child has a real
-    # console subsystem.
+    # console subsystem. stderr=STDOUT (not DEVNULL) merges any traceback
+    # from an app/launcher.py crash into that same pipe, in true
+    # chronological order, so _AppLaunchWaiter's line-by-line log actually
+    # captures it instead of silently discarding the one output that
+    # matters most when the app dies before its window ever appears.
     launcher_path = APP_ROOT / "launcher.py"
     interpreter = shutil.which("pythonw") or sys.executable
     env = os.environ.copy()
@@ -410,7 +487,7 @@ def _spawn_launcher(cache_dir: Path, storage_dir: Path, data_dir: Path) -> subpr
         env=env,
         creationflags=_CREATE_NO_WINDOW,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
     )
@@ -516,13 +593,17 @@ class _AppLaunchWaiter(QObject):
         self._proc = proc
 
     def run(self) -> None:
+        logger = logging.getLogger("App")
         if self._proc.stdout is not None:
             for line in self._proc.stdout:
+                line = line.rstrip("\n")
+                logger.info(line)
                 if _APP_READY_MARKER in line:
                     self.ready.emit()
                     return
                 if line.startswith(_APP_STATUS_PREFIX):
                     self.status.emit(line[len(_APP_STATUS_PREFIX):].strip())
+        logger.warning("app/launcher.py exited before its window appeared")
         self.failed.emit("app/launcher.py exited before its window appeared")
 
 
@@ -566,6 +647,10 @@ class _PortalWindowController(QObject):
         self._wait_worker: _AppLaunchWaiter | None = None
 
     def _launch_and_close(self) -> None:
+        logging.getLogger("Portal").info(
+            "Spawning app/launcher.py (cache=%s, storage=%s, data=%s)",
+            self._cache_dir, self._storage_dir, self._data_dir,
+        )
         proc = _spawn_launcher(self._cache_dir, self._storage_dir, self._data_dir)
         self.progress_bar.show()
         self.progress_bar.setRange(0, 0)
@@ -582,6 +667,7 @@ class _PortalWindowController(QObject):
         self._wait_thread.start()
 
     def _on_app_launched(self) -> None:
+        logging.getLogger("Portal").info("app/launcher.py window ready — closing Portal.")
         self._wait_thread.quit()
         self._wait_thread.wait()
         self._window.close()
@@ -591,14 +677,17 @@ class _PortalWindowController(QObject):
         # spawned process is on its own now either way (it may have shown
         # its own error dialog already, e.g. the Login Required gate in
         # app/launcher.py's main()).
+        logging.getLogger("Portal").error(message)
         self._wait_thread.quit()
         self._wait_thread.wait()
         self._window.close()
 
     def on_status(self, text: str) -> None:
+        logging.getLogger("Portal").info(text)
         self.status_label.setText(text)
 
     def on_warning(self, title: str, message: str) -> None:
+        logging.getLogger("Portal").warning("%s: %s", title, message)
         QMessageBox.warning(self._window, title, message)
 
     def on_ready(self) -> None:
@@ -607,6 +696,7 @@ class _PortalWindowController(QObject):
         self._launch_and_close()
 
     def on_login_needed(self, client_id: str) -> None:
+        logging.getLogger("Portal").info("GitHub sign-in required.")
         self._thread.quit()
         self._thread.wait()
         self.progress_bar.hide()
@@ -617,6 +707,7 @@ class _PortalWindowController(QObject):
 
             dialog = LoginDialog(client_id, self._window)
             if dialog.exec() != QDialog.DialogCode.Accepted:
+                logging.getLogger("Portal").warning("GitHub sign-in cancelled by user.")
                 self._app.exit(1)
                 return
             try:
@@ -632,6 +723,7 @@ class _PortalWindowController(QObject):
         self.launch_button.show()
 
     def on_failed(self, message: str, title: str) -> None:
+        logging.getLogger("Portal").error("%s: %s", title, message)
         self._thread.quit()
         self._thread.wait()
         QMessageBox.critical(self._window, title, message)
@@ -639,6 +731,10 @@ class _PortalWindowController(QObject):
 
 
 def main() -> None:
+    log_path = _setup_logging()
+    logger = logging.getLogger("Portal")
+    logger.info("Portal starting. Log file: %s", log_path)
+
     app = QApplication(sys.argv)
 
     # App is meant to run as a single session — if one is already up
@@ -648,6 +744,7 @@ def main() -> None:
     # below, so a repeat double-click of UkoreHubLauncher.exe while
     # UkoreHub is already open never even flashes Portal's loading screen.
     if _raise_existing_app_instance():
+        logger.info("Existing UkoreHub instance found — raised its window and exiting.")
         return
 
     # Portal is spawned as plain pythonw.exe by UkoreHubLauncher.exe (see
@@ -711,7 +808,9 @@ def main() -> None:
 
     thread.start()
 
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    logger.info("Portal event loop exited (code %s).", exit_code)
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
