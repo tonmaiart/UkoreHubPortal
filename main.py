@@ -4,7 +4,13 @@ app/launcher.py.
 Owns everything UkoreHubLauncher.exe used to do past "update and spawn the
 next thing": the first-run workspace-location prompt, bootstrapping/
 updating the nested app/ clone, installing app/'s Python dependencies,
-checking git-lfs, and GitHub login. The exe itself now only self-updates
+checking git-lfs, GitHub login, and then — in this order — pulling the
+shared data from R2 (cloud_sync.py), picking the Project
+(comboBox_project in UkoreHubPortal.ui, see _on_cloud_synced; the app has
+no selector of its own anymore), and
+updating that project's cache/plugins/ repo plugins (plugin_update.py), so
+all three are settled before app/launcher.py is spawned and nothing needs
+a restart. The exe itself now only self-updates
 and bootstraps/updates Portal's own checkout before spawning this file —
 see developer/launcher/launcher_build/updater.py's
 _launch/_do_prelaunch_work.
@@ -38,8 +44,8 @@ hanging forever. pushButton_launch stays hidden through the whole
 preflight path; it only ever appears, relabeled, for the one case that
 genuinely needs a human click — GitHub sign-in (see on_login_needed) —
 since popping a device-flow dialog and a browser tab with no warning
-would be startling. No project dashboard or "Back to Portal" round-trip
-yet — those are later slices layered onto this same entry point.
+would be startling. The project picker is the other interactive step (see
+_select_project).
 
 Both Portal and app/launcher.py run under pythonw (no console/stdout a
 person can ever see), so main() calls _setup_logging() first thing to
@@ -62,12 +68,22 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+# Must be imported before PySide6 — same six.moves/shibokensupport import
+# hook crash app/launcher.py's own top-of-file boto3 import works around
+# (see its comment); cloud_sync.py only imports boto3 lazily, well after
+# PySide6 is loaded.
+try:
+    import boto3  # noqa: F401
+except ImportError:
+    pass
+
 from PySide6.QtCore import QFile, QIODevice, QObject, Qt, QThread, Signal
 from PySide6.QtGui import QColor, QIcon, QPalette, QPixmap
 from PySide6.QtNetwork import QLocalSocket
 from PySide6.QtUiTools import QUiLoader
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QFileDialog,
     QLabel,
@@ -143,6 +159,13 @@ _APP_STATUS_PREFIX = "UKOREHUB_APP_STATUS:"
 # Must match app/launcher.py's own SINGLETON_SERVER_NAME exactly — see
 # _raise_existing_app_instance below.
 _APP_SINGLETON_SERVER_NAME = "UkoreHubApp"
+
+# Written into cache_dir by the app's Settings > Account "Go Back To
+# Portal" button (app/interface/main_window.py's
+# _on_back_to_portal_requested) — forces the project picker open even with
+# a single project, then deleted. Keep in sync with that file's
+# _SHOW_PROJECT_PICKER_MARKER.
+_SHOW_PROJECT_PICKER_MARKER = "portal_show_project_picker"
 
 # One file per Portal launch, named so the most recent is always last when
 # sorted alphabetically/by mtime — the whole point is "what's the latest
@@ -471,7 +494,7 @@ def _apply_logo(window) -> None:
     )
 
 
-def _spawn_launcher(cache_dir: Path, storage_dir: Path, data_dir: Path) -> subprocess.Popen:
+def _spawn_launcher(cache_dir: Path, storage_dir: Path, data_dir: Path, etags_path: Path | None) -> subprocess.Popen:
     # pythonw (no console subsystem) + CREATE_NO_WINDOW — the artist-facing
     # app should never flash a terminal. stdout is still piped (rather than
     # left to inherit/discard) so _AppLaunchWaiter can watch for
@@ -488,6 +511,12 @@ def _spawn_launcher(cache_dir: Path, storage_dir: Path, data_dir: Path) -> subpr
     env["UKOREHUB_CACHE_DIR"] = str(cache_dir)
     env["UKOREHUB_STORAGE_DIR"] = str(storage_dir)
     env["UKOREHUB_DATA_DIR"] = str(data_dir)
+    # Always set, so app/launcher.py knows Portal already did the cloud
+    # pull: a path means "seed your ETags from this, don't pull again"; an
+    # empty value means Portal couldn't reach the cloud (or it isn't
+    # configured), so the app runs local-only instead of timing out a
+    # second time. See cloud_sync.py.
+    env["UKOREHUB_CLOUD_ETAGS"] = str(etags_path) if etags_path else ""
     return subprocess.Popen(
         [interpreter, str(launcher_path)],
         cwd=str(APP_ROOT),
@@ -581,6 +610,30 @@ class _PreflightWorker(QObject):
         self.login_needed.emit(client_id)
 
 
+class _BackgroundTask(QObject):
+    """Runs one post-login step (cloud pull, plugin update) on its own
+    QThread so the status label stays live. fn gets a status callback and
+    whatever it returns comes back through done; an exception is logged
+    and done(None) is emitted instead — neither step is allowed to block
+    the launch."""
+
+    status = Signal(str)
+    done = Signal(object)
+
+    def __init__(self, fn, error_message: str):
+        super().__init__()
+        self._fn = fn
+        self._error_message = error_message
+
+    def run(self) -> None:
+        try:
+            result = self._fn(self.status.emit)
+        except Exception:
+            logging.getLogger("Portal").exception(self._error_message)
+            result = None
+        self.done.emit(result)
+
+
 class _AppLaunchWaiter(QObject):
     """Watches the just-spawned app/launcher.py process's stdout for
     _APP_READY_MARKER on a background QThread (see
@@ -627,17 +680,22 @@ class _PortalWindowController(QObject):
     "QThread::wait: Thread tried to wait on itself".
 
     pushButton_launch has no "click to launch" role at all here — see
-    module docstring. It stays hidden except in on_login_needed, where
-    it's the only way forward (sign-in has to be an explicit click, not
-    something that pops a browser tab on its own)."""
+    module docstring. It stays hidden except at the two steps that need a
+    human: sign-in ("Sign in" — sign-in has to be an explicit click, not
+    something that pops a browser tab on its own) and the project picker
+    ("Open", alongside comboBox_project and pushButton_logout — see
+    _show_project_picker)."""
 
-    def __init__(self, app, window, thread, token_store, local_config_store, cache_dir, storage_dir, data_dir):
+    def __init__(
+        self, app, window, thread, token_store, local_config_store, system_config_store, cache_dir, storage_dir, data_dir
+    ):
         super().__init__()
         self._app = app
         self._window = window
         self._thread = thread
         self._token_store = token_store
         self._local_config_store = local_config_store
+        self._system_config_store = system_config_store
         self._cache_dir = cache_dir
         self._storage_dir = storage_dir
         self._data_dir = data_dir
@@ -645,20 +703,155 @@ class _PortalWindowController(QObject):
         self.status_label = window.findChild(QLabel, "label_loading_info")
         self.progress_bar = window.findChild(QProgressBar, "progressBar_loading")
         self.launch_button = window.findChild(QPushButton, "pushButton_launch")
+        self.logout_button = window.findChild(QPushButton, "pushButton_logout")
+        self.project_label = window.findChild(QLabel, "label_project")
+        self.project_combo = window.findChild(QComboBox, "comboBox_project")
+        self.logout_button.clicked.connect(self._on_logout_clicked)
         self.launch_button.hide()
+        self._set_project_picker_visible(False)
 
         # Kept alive as instance attributes (same reasoning as `controller`
         # itself in main()) for however long _AppLaunchWaiter.run() blocks
         # on readline() — created lazily in _launch_and_close, not here.
         self._wait_thread: QThread | None = None
         self._wait_worker: _AppLaunchWaiter | None = None
+        self._task_thread: QThread | None = None
+        self._task_worker: _BackgroundTask | None = None
+        self._etags_path: Path | None = None
+
+    def _run_task(self, fn, error_message: str, on_done) -> None:
+        self.progress_bar.show()
+        self.progress_bar.setRange(0, 0)
+        self.launch_button.hide()
+        self._task_thread = QThread()
+        self._task_worker = _BackgroundTask(fn, error_message)
+        self._task_worker.moveToThread(self._task_thread)
+        self._task_thread.started.connect(self._task_worker.run)
+        self._task_worker.status.connect(self.on_status)
+        self._task_worker.done.connect(on_done)
+        self._task_thread.start()
+
+    def _finish_task(self) -> None:
+        self._task_thread.quit()
+        self._task_thread.wait()
+
+    def _sync_cloud_then_continue(self) -> None:
+        from cloud_sync import pull_shared_data
+
+        def _pull(on_status):
+            etags_path = pull_shared_data(
+                data_dir=self._data_dir,
+                appdata_dir=APP_ROOT / "appdata",
+                cache_dir=self._cache_dir,
+                on_status=on_status,
+            )
+            if etags_path is None:
+                logging.getLogger("Portal").warning("Cloud sync not configured — shared data stays local-only.")
+            return etags_path
+
+        self.on_status("Connecting to cloud sync...")
+        self._run_task(_pull, "Cloud sync unavailable — using local data.", self._on_cloud_synced)
+
+    def _set_action(self, text: str, slot) -> None:
+        # pushButton_launch is reused for "Sign in" and "Open" — drop
+        # whatever the previous step connected so one click never fires both.
+        try:
+            self.launch_button.clicked.disconnect()
+        except (RuntimeError, TypeError):
+            pass
+        self.launch_button.setText(text)
+        self.launch_button.clicked.connect(slot)
+        self.launch_button.show()
+
+    def _set_project_picker_visible(self, visible: bool) -> None:
+        self.project_label.setVisible(visible)
+        self.project_combo.setVisible(visible)
+        self.logout_button.setVisible(visible)
+
+    def _on_cloud_synced(self, etags_path) -> None:
+        """Project picker is shown every launch when there's more than one
+        project (the last one used is preselected), or with any number of
+        projects when the app's "Go Back To Portal" asked for it — Portal is
+        where a project is picked; the app itself has no selector anymore."""
+        from cloud_sync import list_projects
+
+        self._finish_task()
+        self._etags_path = etags_path
+
+        marker = self._cache_dir / _SHOW_PROJECT_PICKER_MARKER
+        forced = marker.exists()
+        if forced:
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+
+        projects = list_projects(self._data_dir)
+        if len(projects) > 1 or (projects and forced):
+            self._show_project_picker(projects)
+            return
+        if projects:
+            self._use_project(projects[0][0])
+        self._update_plugins_then_launch()
+
+    def _show_project_picker(self, projects: list[tuple[str, str]]) -> None:
+        self.progress_bar.hide()
+        self.status_label.setText("Choose a project.")
+        self.project_combo.clear()
+        for project_id, name in projects:
+            self.project_combo.addItem(name, project_id)
+        current_index = self.project_combo.findData(self._local_config_store.active_project_id)
+        self.project_combo.setCurrentIndex(max(current_index, 0))
+        self._set_project_picker_visible(True)
+        self._set_action("Open", self._on_project_chosen)
+
+    def _on_project_chosen(self) -> None:
+        project_id = self.project_combo.currentData()
+        if not project_id:
+            return
+        self._set_project_picker_visible(False)
+        self._use_project(project_id)
+        self._update_plugins_then_launch()
+
+    def _use_project(self, project_id: str) -> None:
+        if project_id != self._local_config_store.active_project_id:
+            self._local_config_store.set_active_project(project_id)
+
+    def _on_logout_clicked(self) -> None:
+        logging.getLogger("Portal").info("Logging out of GitHub.")
+        self._set_project_picker_visible(False)
+        self._token_store.clear_token()
+        self._local_config_store.set_github_username(None)
+        self._local_config_store.set_github_login_at(None)
+        self.on_login_needed(self._system_config_store.github_client_id or DEFAULT_GITHUB_CLIENT_ID)
+
+    def _update_plugins_then_launch(self) -> None:
+        from plugin_update import update_plugins
+
+        def _update(on_status):
+            on_status("Checking plugins...")
+            update_plugins(
+                cache_dir=self._cache_dir,
+                data_dir=self._data_dir,
+                storage_dir=self._storage_dir,
+                project_id=self._local_config_store.active_project_id,
+                active_repo_id=self._local_config_store.active_repo_id,
+                token=self._token_store.load_token(),
+                on_status=on_status,
+            )
+
+        self._run_task(_update, "Plugin update failed — launching with plugins as-is.", self._on_plugins_updated)
+
+    def _on_plugins_updated(self, _result) -> None:
+        self._finish_task()
+        self._launch_and_close()
 
     def _launch_and_close(self) -> None:
         logging.getLogger("Portal").info(
             "Spawning app/launcher.py (cache=%s, storage=%s, data=%s)",
             self._cache_dir, self._storage_dir, self._data_dir,
         )
-        proc = _spawn_launcher(self._cache_dir, self._storage_dir, self._data_dir)
+        proc = _spawn_launcher(self._cache_dir, self._storage_dir, self._data_dir, self._etags_path)
         self.progress_bar.show()
         self.progress_bar.setRange(0, 0)
         self.status_label.setText("Starting UkoreHub...")
@@ -700,7 +893,7 @@ class _PortalWindowController(QObject):
     def on_ready(self) -> None:
         self._thread.quit()
         self._thread.wait()
-        self._launch_and_close()
+        self._sync_cloud_then_continue()
 
     def on_login_needed(self, client_id: str) -> None:
         logging.getLogger("Portal").info("GitHub sign-in required.")
@@ -723,11 +916,9 @@ class _PortalWindowController(QObject):
                 QMessageBox.warning(self._window, "GitHub Login", str(exc))
             self._local_config_store.set_github_username(dialog.username)
             self._local_config_store.set_github_login_at(datetime.now(timezone.utc).isoformat())
-            self._launch_and_close()
+            self._sync_cloud_then_continue()
 
-        self.launch_button.setText("Sign in")
-        self.launch_button.clicked.connect(_start_login)
-        self.launch_button.show()
+        self._set_action("Sign in", _start_login)
 
     def on_failed(self, message: str, title: str) -> None:
         logging.getLogger("Portal").error("%s: %s", title, message)
@@ -805,7 +996,7 @@ def main() -> None:
     # until app.exec() returns) — Qt would otherwise garbage-collect an
     # unreferenced QObject with live signal connections.
     controller = _PortalWindowController(
-        app, window, thread, token_store, local_config_store, cache_dir, storage_dir, data_dir
+        app, window, thread, token_store, local_config_store, system_config_store, cache_dir, storage_dir, data_dir
     )
     worker.status.connect(controller.on_status)
     worker.warning.connect(controller.on_warning)

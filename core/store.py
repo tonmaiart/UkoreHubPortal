@@ -29,7 +29,8 @@ def _atomic_write(path: Path, data: dict) -> None:
 
 class LocalConfigStore:
     """Per-machine settings — never shared, gitignored. Only the fields
-    Portal itself touches (github_username/github_login_at) are written
+    Portal itself touches (active_project_id, github_username/
+    github_login_at) are written
     here, but every other known field is round-tripped through
     load()/save() unchanged so this never clobbers what app/launcher.py's
     own LocalConfigStore wrote."""
@@ -68,6 +69,14 @@ class LocalConfigStore:
                 "github_login_at": self.github_login_at,
             },
         )
+
+    def set_active_project(self, project_id: str | None) -> None:
+        # Clears active_repo_id too, same as app/core's own version — a repo
+        # id left over from another project would resolve against the wrong
+        # registry.
+        self.active_project_id = project_id
+        self.active_repo_id = None
+        self.save()
 
     def set_github_username(self, username: str | None) -> None:
         self.github_username = username
