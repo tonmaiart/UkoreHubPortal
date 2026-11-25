@@ -11,14 +11,10 @@ other if it should apply to both.
 """
 from __future__ import annotations
 
-import os
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 from typing import Callable
 
-_NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+from git_util import GitError, git_succeeds, run_git
 
 # Per-machine/in-flight paths `git clean -fd` must never sweep — see
 # updater.py's own _CLEAN_PROTECTED_PATTERNS for the incident this
@@ -30,51 +26,12 @@ _CLEAN_PROTECTED_PATTERNS = [
 ]
 
 
-class UpdateError(Exception):
-    pass
-
-
-def _non_interactive_env() -> dict:
-    env = os.environ.copy()
-    env["GIT_TERMINAL_PROMPT"] = "0"
-    ssh_command = env.get("GIT_SSH_COMMAND", "ssh")
-    env["GIT_SSH_COMMAND"] = f"{ssh_command} -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
-    return env
-
-
-def _run_git(args: list[str], cwd: Path) -> str:
-    git_executable = shutil.which("git") or "git"
-    result = subprocess.run(
-        [git_executable, *args],
-        cwd=str(cwd),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        env=_non_interactive_env(),
-        creationflags=_NO_WINDOW_FLAGS,
-    )
-    if result.returncode != 0:
-        raise UpdateError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
-    return result.stdout.strip()
-
-
 def is_git_repo(repo_root: Path) -> bool:
     """True only for a working checkout with an actual commit checked out —
     not just a `.git` directory. See updater.py's own version of this
     function for why (a `.git` dir can be left over from a bootstrap that
     failed partway, with no commits yet)."""
-    if not (repo_root / ".git").exists():
-        return False
-    result = subprocess.run(
-        [shutil.which("git") or "git", "rev-parse", "--verify", "-q", "HEAD"],
-        cwd=str(repo_root),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        env=_non_interactive_env(),
-        creationflags=_NO_WINDOW_FLAGS,
-    )
-    return result.returncode == 0
+    return (repo_root / ".git").exists() and git_succeeds(["rev-parse", "--verify", "-q", "HEAD"], repo_root)
 
 
 def bootstrap_git_repo(
@@ -86,19 +43,19 @@ def bootstrap_git_repo(
     failed attempt (see is_git_repo)."""
     status = on_status or (lambda _msg: None)
     status("Setting up UkoreHub repository...")
-    _run_git(["init"], cwd=repo_root)
-    existing_remotes = _run_git(["remote"], cwd=repo_root).split()
+    run_git(["init"], cwd=repo_root)
+    existing_remotes = run_git(["remote"], cwd=repo_root).split()
     if "origin" in existing_remotes:
-        _run_git(["remote", "set-url", "origin", remote_url], cwd=repo_root)
+        run_git(["remote", "set-url", "origin", remote_url], cwd=repo_root)
     else:
-        _run_git(["remote", "add", "origin", remote_url], cwd=repo_root)
+        run_git(["remote", "add", "origin", remote_url], cwd=repo_root)
     status("Downloading UkoreHub (first run)...")
-    _run_git(["fetch", "origin", branch], cwd=repo_root)
+    run_git(["fetch", "origin", branch], cwd=repo_root)
     status("Checking out UkoreHub...")
     try:
-        _run_git(["checkout", "-B", branch, "--track", f"origin/{branch}"], cwd=repo_root)
-    except UpdateError:
-        _run_git(["checkout", "-f", "-B", branch, "--track", f"origin/{branch}"], cwd=repo_root)
+        run_git(["checkout", "-B", branch, "--track", f"origin/{branch}"], cwd=repo_root)
+    except GitError:
+        run_git(["checkout", "-f", "-B", branch, "--track", f"origin/{branch}"], cwd=repo_root)
 
 
 def _clean_untracked(repo_root: Path) -> None:
@@ -106,8 +63,8 @@ def _clean_untracked(repo_root: Path) -> None:
     for pattern in _CLEAN_PROTECTED_PATTERNS:
         args.extend(["-e", pattern])
     try:
-        _run_git(args, cwd=repo_root)
-    except UpdateError:
+        run_git(args, cwd=repo_root)
+    except GitError:
         pass
 
 
@@ -124,12 +81,12 @@ def ensure_up_to_date(
         bootstrap_git_repo(repo_root, remote_url, branch, on_status)
         return
     status("Checking for app updates...")
-    _run_git(["fetch"], cwd=repo_root)
-    local_head = _run_git(["rev-parse", "HEAD"], cwd=repo_root)
-    upstream_head = _run_git(["rev-parse", "@{u}"], cwd=repo_root)
+    run_git(["fetch"], cwd=repo_root)
+    local_head = run_git(["rev-parse", "HEAD"], cwd=repo_root)
+    upstream_head = run_git(["rev-parse", "@{u}"], cwd=repo_root)
     if local_head != upstream_head:
         status("Downloading app updates...")
         _clean_untracked(repo_root)
-        _run_git(["reset", "--hard", upstream_head], cwd=repo_root)
+        run_git(["reset", "--hard", upstream_head], cwd=repo_root)
     else:
         status("UkoreHub is up to date.")

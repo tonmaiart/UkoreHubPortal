@@ -53,10 +53,11 @@ class TokenStore:
                 return token
         except Exception:
             pass
-        if self.fallback_path.exists():
+        try:
             data = json.loads(self.fallback_path.read_text(encoding="utf-8"))
-            return data.get("token")
-        return None
+        except (OSError, ValueError):
+            return None
+        return data.get("token") if isinstance(data, dict) else None
 
     def clear_token(self) -> None:
         try:

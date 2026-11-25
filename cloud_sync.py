@@ -10,8 +10,15 @@ push() needs the ETag last seen for each blob as its If-Match
 precondition, so every ETag seen here is written to ETAGS_FILENAME in
 cache_dir and handed to app/launcher.py via the UKOREHUB_CLOUD_ETAGS env
 var, which seeds its own R2JsonSync instead of pulling everything a
-second time. Keep this file's blob list in sync with app/launcher.py's
-own pull fallback.
+second time. _FIXED_BLOBS must match app/launcher.py's _SHARED_FIXED_BLOBS
+(checked by developer/app/tests/test_portal_app_contract.py).
+
+A blob that fails to pull is left out of the ETags file rather than
+failing the whole pull: the app's push() of a blob with no seeded ETag is
+create-only (IfNoneMatch="*"), so it can only ever conflict and re-pull,
+never clobber the cloud copy — whereas falling back to local-only for the
+whole session would silently drop every edit made in it (next launch's
+pull overwrites them).
 
 Credentials come from the same UKOREHUB_R2_* env vars UkoreHubLauncher.exe
 already sets on Portal's process (see
@@ -20,15 +27,20 @@ developer/launcher/launcher_build/updater.py) — never from a JSON file.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable
 
+from core.store import atomic_write_bytes, read_json
+
 ETAGS_FILENAME = "cloud_etags.json"
 
 _FIXED_BLOBS = ("projects.json", "programs.json", "system_config.json")
 _TIMEOUT_SECONDS = 20
+
+logger = logging.getLogger("PortalCloudSync")
 
 
 class CloudSyncUnavailable(Exception):
@@ -40,20 +52,11 @@ def _bucket_name(data_dir: Path, appdata_dir: Path) -> str | None:
     # local system_config.json is itself one of the synced blobs, so a
     # fresh machine falls back to the env var, then app/appdata's
     # git-tracked default.
-    try:
-        name = json.loads((data_dir / "system_config.json").read_text(encoding="utf-8")).get("r2_bucket_name")
-    except (OSError, ValueError):
-        name = None
-    if name:
-        return name
-    if os.environ.get("UKOREHUB_R2_BUCKET_NAME"):
-        return os.environ["UKOREHUB_R2_BUCKET_NAME"]
-    try:
-        return json.loads((appdata_dir / "system_config.default.json").read_text(encoding="utf-8")).get(
-            "r2_bucket_name"
-        )
-    except (OSError, ValueError):
-        return None
+    return (
+        read_json(data_dir / "system_config.json").get("r2_bucket_name")
+        or os.environ.get("UKOREHUB_R2_BUCKET_NAME")
+        or read_json(appdata_dir / "system_config.default.json").get("r2_bucket_name")
+    )
 
 
 def _build_client():
@@ -74,16 +77,16 @@ def _build_client():
     )
 
 
-def _read_project_ids(index_path: Path) -> list[str]:
-    try:
-        data = json.loads(index_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+def _index_projects(data_dir: Path) -> list[dict]:
+    return [project for project in read_json(data_dir / "projects.json").get("projects", []) if project.get("id")]
+
+
+def _read_project_ids(data_dir: Path) -> list[str]:
     # schema_version < 2 still has repos embedded — nothing per-project to
     # pull yet, same as app/core's read_project_ids returning None.
-    if data.get("schema_version", 1) < 2:
+    if read_json(data_dir / "projects.json").get("schema_version", 1) < 2:
         return []
-    return [project["id"] for project in data.get("projects", []) if project.get("id")]
+    return [project["id"] for project in _index_projects(data_dir)]
 
 
 def pull_shared_data(
@@ -92,8 +95,9 @@ def pull_shared_data(
     """Returns the ETags file path to hand to app/launcher.py, or None when
     cloud sync isn't configured on this machine (no UKOREHUB_R2_* env vars
     or no bucket name) — the app then stays local-only, same as before.
-    Raises CloudSyncUnavailable on a network/R2 failure; the caller decides
-    whether to carry on with the local copy."""
+    Raises CloudSyncUnavailable only when R2 is unreachable altogether
+    (every fixed blob failed); the caller decides whether to carry on with
+    the local copy."""
     from botocore.exceptions import BotoCoreError, ClientError
 
     status = on_status or (lambda _msg: None)
@@ -103,46 +107,48 @@ def pull_shared_data(
         return None
 
     etags: dict[str, str | None] = {}
+    failures: dict[str, str] = {}
 
     def _pull(blob_name: str) -> None:
         try:
             response = client.get_object(Bucket=bucket, Key=blob_name)
+            payload = response["Body"].read()
         except ClientError as exc:
             if exc.response.get("Error", {}).get("Code", "") in ("NoSuchKey", "404"):
                 etags[blob_name] = None
                 return
-            raise
-        local_path = data_dir / blob_name
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_bytes(response["Body"].read())
+            failures[blob_name] = str(exc)
+            return
+        except (BotoCoreError, OSError) as exc:
+            failures[blob_name] = str(exc)
+            return
+        try:
+            atomic_write_bytes(data_dir / blob_name, payload)
+        except OSError as exc:
+            failures[blob_name] = str(exc)
+            return
         etags[blob_name] = response["ETag"]
 
     status("Syncing shared data from cloud...")
-    try:
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            list(pool.map(_pull, _FIXED_BLOBS))
-        project_ids = _read_project_ids(data_dir / "projects.json")
-        if project_ids:
-            status("Syncing project data from cloud...")
-            with ThreadPoolExecutor(max_workers=8) as pool:
-                list(pool.map(_pull, [f"projects/{project_id}.json" for project_id in project_ids]))
-    except (BotoCoreError, ClientError, OSError) as exc:
-        raise CloudSyncUnavailable(str(exc)) from exc
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(_pull, _FIXED_BLOBS))
+    if all(blob_name in failures for blob_name in _FIXED_BLOBS):
+        raise CloudSyncUnavailable(failures[_FIXED_BLOBS[0]])
+
+    project_ids = _read_project_ids(data_dir)
+    if project_ids:
+        status("Syncing project data from cloud...")
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(_pull, [f"projects/{project_id}.json" for project_id in project_ids]))
+
+    for blob_name, message in failures.items():
+        logger.warning("Could not pull '%s' — keeping the local copy: %s", blob_name, message)
 
     etags_path = cache_dir / ETAGS_FILENAME
-    etags_path.parent.mkdir(parents=True, exist_ok=True)
-    etags_path.write_text(json.dumps(etags, indent=2), encoding="utf-8")
+    atomic_write_bytes(etags_path, json.dumps(etags, indent=2).encode("utf-8"))
     return etags_path
 
 
 def list_projects(data_dir: Path) -> list[tuple[str, str]]:
     """(id, name) for every project in data_dir's projects.json index."""
-    try:
-        data = json.loads((data_dir / "projects.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-    return [
-        (project["id"], project.get("name") or project["id"])
-        for project in data.get("projects", [])
-        if project.get("id")
-    ]
+    return [(project["id"], project.get("name") or project["id"]) for project in _index_projects(data_dir)]

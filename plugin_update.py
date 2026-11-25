@@ -20,43 +20,27 @@ The catalog/requirements are read from data_dir's projects/<id>.json,
 which cloud_sync.py has just pulled, for the project the user just
 picked (Portal's project combobox, main.py's _on_cloud_synced) — both happen right before this runs.
 
-GitHub HTTPS auth mirrors app/core/vcs/git_service.py's
-_github_auth_args_and_env (the signed-in token via a one-off credential
-helper, never on the command line) — vendored, since Portal can't import
-app/ (see main.py's module docstring).
+GitHub HTTPS auth goes through git_util.run_git.
 """
 from __future__ import annotations
 
 import json
 import logging
-import shutil
-import subprocess
-import sys
-import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from git_update import _non_interactive_env
-
-_NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-
-_GITHUB_TOKEN_ENV_VAR = "UKOREHUB_GITHUB_TOKEN"
-_GITHUB_HOSTS = {"github.com", "www.github.com"}
+from git_util import GitError, run_git
 
 # Must match app/plugins/core/project_editor/plugin.py's
 # _EXTERNAL_PLUGINS_PLUGIN_ID — the Project.plugin_data key the catalog
-# lives under.
+# lives under (checked by developer/app/tests/test_portal_app_contract.py).
 _EXTERNAL_PLUGINS_KEY = "external_plugins"
 
 _MAX_PARALLEL = 8
 
 logger = logging.getLogger("PortalPlugins")
-
-
-class _GitError(Exception):
-    pass
 
 
 @dataclass
@@ -66,39 +50,15 @@ class _CatalogEntry:
     folder_name: str
 
 
-def _git(args: list[str], cwd: Path, *, token: str | None = None, url: str = "") -> str:
-    auth_args: list[str] = []
-    extra_env: dict = {}
-    parsed = urllib.parse.urlparse(url)
-    if token and parsed.scheme == "https" and parsed.hostname in _GITHUB_HOSTS:
-        helper = f'!f() {{ echo username=x-access-token; echo "password=${_GITHUB_TOKEN_ENV_VAR}"; }}; f'
-        auth_args = ["-c", "credential.helper=", "-c", f"credential.helper={helper}"]
-        extra_env = {_GITHUB_TOKEN_ENV_VAR: token}
-    env = _non_interactive_env()
-    env.update(extra_env)
-    result = subprocess.run(
-        [shutil.which("git") or "git", *auth_args, *args],
-        cwd=str(cwd),
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        env=env,
-        creationflags=_NO_WINDOW_FLAGS,
-    )
-    if result.returncode != 0:
-        raise _GitError(result.stderr.strip() or f"git {args[0]} failed")
-    return result.stdout.strip()
-
-
 def _is_repo_root(path: Path) -> bool:
     # Same guard as GitService.is_repo_root: a broken/empty .git would let
     # git's discovery walk up to whatever real repo sits above cache/.
     if not (path / ".git").exists():
         return False
     try:
-        toplevel = _git(["rev-parse", "--show-toplevel"], path)
+        toplevel = run_git(["rev-parse", "--show-toplevel"], path)
         return Path(toplevel).resolve() == path.resolve()
-    except (_GitError, OSError):
+    except (GitError, OSError):
         return False
 
 
@@ -146,13 +106,13 @@ def _update_clone(path: Path, token: str | None) -> str:
     if (path / ".git" / "MERGE_HEAD").exists():
         return "skipped (unresolved merge)"
     try:
-        url = _git(["remote", "get-url", "origin"], path)
-    except _GitError:
+        url = run_git(["remote", "get-url", "origin"], path)
+    except GitError:
         return "skipped (no origin remote)"
-    _git(["fetch", "origin"], path, token=token, url=url)
+    run_git(["fetch", "origin"], path, token=token, url=url)
     try:
-        counts = _git(["rev-list", "--left-right", "--count", "HEAD...@{u}"], path)
-    except _GitError:
+        counts = run_git(["rev-list", "--left-right", "--count", "HEAD...@{u}"], path)
+    except GitError:
         return "skipped (no upstream branch)"
     ahead, behind = (int(value) for value in counts.split())
     if behind == 0:
@@ -160,14 +120,22 @@ def _update_clone(path: Path, token: str | None) -> str:
     if ahead > 0:
         return f"skipped ({ahead} local commit(s) not pushed, {behind} behind)"
     try:
-        _git(["merge", "--ff-only", "@{u}"], path, token=token, url=url)
-    except _GitError as exc:
+        run_git(["merge", "--ff-only", "@{u}"], path, token=token, url=url)
+    except GitError as exc:
         return f"skipped (local changes block update: {exc})"
     return f"updated ({behind} commit(s))"
 
 
 def _clone(entry: _CatalogEntry, plugins_root: Path, token: str | None) -> str:
-    _git(["clone", entry.git_url, str(plugins_root / entry.folder_name)], plugins_root, token=token, url=entry.git_url)
+    # "--" because git_url comes from the shared R2 catalog anyone with the
+    # exe can write to — a value starting with "-" must never parse as an
+    # option.
+    run_git(
+        ["clone", "--", entry.git_url, str(plugins_root / entry.folder_name)],
+        plugins_root,
+        token=token,
+        url=entry.git_url,
+    )
     return "cloned"
 
 

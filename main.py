@@ -144,9 +144,10 @@ TOKEN_REVALIDATE_INTERVAL = timedelta(hours=12)
 
 _CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-# Must match the literal app/launcher.py's _reveal_window() prints right
-# after window.showMaximized() — see that file's own comment and this
-# module's docstring.
+# Must match app/launcher.py's own _APP_READY_MARKER, printed right after
+# window.showMaximized() — see this module's docstring. This and the other
+# "must match" constants below are checked by
+# developer/app/tests/test_portal_app_contract.py.
 _APP_READY_MARKER = "UKOREHUB_APP_WINDOW_READY"
 
 # Must match app/launcher.py's own _APP_STATUS_PREFIX exactly — each line
@@ -195,6 +196,27 @@ def _token_recently_validated(local_config_store) -> bool:
     if checked_at.tzinfo is None:
         checked_at = checked_at.replace(tzinfo=timezone.utc)
     return datetime.now(timezone.utc) - checked_at < TOKEN_REVALIDATE_INTERVAL
+
+
+def _clear_github_session(token_store, local_config_store) -> None:
+    token_store.clear_token()
+    local_config_store.set_github_session(None, None)
+
+
+def _new_worker_thread(worker: QObject) -> QThread:
+    """Moves worker onto a fresh, not-yet-started QThread wired to call
+    worker.run() on start — the caller connects worker's signals first,
+    then calls start()."""
+    thread = QThread()
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
+    return thread
+
+
+def _stop_thread(thread: QThread | None) -> None:
+    if thread is not None:
+        thread.quit()
+        thread.wait()
 
 
 def _raise_existing_app_instance() -> bool:
@@ -591,9 +613,7 @@ class _PreflightWorker(QObject):
                 # Revoked/expired, or just offline — either way don't trust
                 # a token we can't confirm; clear it and fall through to
                 # login.
-                self._token_store.clear_token()
-                self._local_config_store.set_github_username(None)
-                self._local_config_store.set_github_login_at(None)
+                _clear_github_session(self._token_store, self._local_config_store)
                 token = None
             else:
                 # Refresh the timestamp so the next TOKEN_REVALIDATE_INTERVAL
@@ -723,17 +743,14 @@ class _PortalWindowController(QObject):
         self.progress_bar.show()
         self.progress_bar.setRange(0, 0)
         self.launch_button.hide()
-        self._task_thread = QThread()
         self._task_worker = _BackgroundTask(fn, error_message)
-        self._task_worker.moveToThread(self._task_thread)
-        self._task_thread.started.connect(self._task_worker.run)
+        self._task_thread = _new_worker_thread(self._task_worker)
         self._task_worker.status.connect(self.on_status)
         self._task_worker.done.connect(on_done)
         self._task_thread.start()
 
     def _finish_task(self) -> None:
-        self._task_thread.quit()
-        self._task_thread.wait()
+        _stop_thread(self._task_thread)
 
     def _sync_cloud_then_continue(self) -> None:
         from cloud_sync import pull_shared_data
@@ -777,6 +794,7 @@ class _PortalWindowController(QObject):
 
         self._finish_task()
         self._etags_path = etags_path
+        self._system_config_store.load()
 
         marker = self._cache_dir / _SHOW_PROJECT_PICKER_MARKER
         forced = marker.exists()
@@ -820,9 +838,7 @@ class _PortalWindowController(QObject):
     def _on_logout_clicked(self) -> None:
         logging.getLogger("Portal").info("Logging out of GitHub.")
         self._set_project_picker_visible(False)
-        self._token_store.clear_token()
-        self._local_config_store.set_github_username(None)
-        self._local_config_store.set_github_login_at(None)
+        _clear_github_session(self._token_store, self._local_config_store)
         self.on_login_needed(self._system_config_store.github_client_id or DEFAULT_GITHUB_CLIENT_ID)
 
     def _update_plugins_then_launch(self) -> None:
@@ -857,10 +873,8 @@ class _PortalWindowController(QObject):
         self.status_label.setText("Starting UkoreHub...")
         self.launch_button.hide()
 
-        self._wait_thread = QThread()
         self._wait_worker = _AppLaunchWaiter(proc)
-        self._wait_worker.moveToThread(self._wait_thread)
-        self._wait_thread.started.connect(self._wait_worker.run)
+        self._wait_thread = _new_worker_thread(self._wait_worker)
         self._wait_worker.ready.connect(self._on_app_launched)
         self._wait_worker.status.connect(self.on_status)
         self._wait_worker.failed.connect(self._on_app_launch_failed)
@@ -868,8 +882,7 @@ class _PortalWindowController(QObject):
 
     def _on_app_launched(self) -> None:
         logging.getLogger("Portal").info("app/launcher.py window ready — closing Portal.")
-        self._wait_thread.quit()
-        self._wait_thread.wait()
+        _stop_thread(self._wait_thread)
         self._window.close()
 
     def _on_app_launch_failed(self, message: str) -> None:
@@ -878,8 +891,7 @@ class _PortalWindowController(QObject):
         # its own error dialog already, e.g. the Login Required gate in
         # app/launcher.py's main()).
         logging.getLogger("Portal").error(message)
-        self._wait_thread.quit()
-        self._wait_thread.wait()
+        _stop_thread(self._wait_thread)
         self._window.close()
 
     def on_status(self, text: str) -> None:
@@ -891,14 +903,12 @@ class _PortalWindowController(QObject):
         QMessageBox.warning(self._window, title, message)
 
     def on_ready(self) -> None:
-        self._thread.quit()
-        self._thread.wait()
+        _stop_thread(self._thread)
         self._sync_cloud_then_continue()
 
     def on_login_needed(self, client_id: str) -> None:
         logging.getLogger("Portal").info("GitHub sign-in required.")
-        self._thread.quit()
-        self._thread.wait()
+        _stop_thread(self._thread)
         self.progress_bar.hide()
         self.status_label.setText("Sign-in required to continue.")
 
@@ -914,16 +924,14 @@ class _PortalWindowController(QObject):
                 self._token_store.save_token(dialog.token)
             except TokenStoreFallbackUsed as exc:
                 QMessageBox.warning(self._window, "GitHub Login", str(exc))
-            self._local_config_store.set_github_username(dialog.username)
-            self._local_config_store.set_github_login_at(datetime.now(timezone.utc).isoformat())
+            self._local_config_store.set_github_session(dialog.username, datetime.now(timezone.utc).isoformat())
             self._sync_cloud_then_continue()
 
         self._set_action("Sign in", _start_login)
 
     def on_failed(self, message: str, title: str) -> None:
         logging.getLogger("Portal").error("%s: %s", title, message)
-        self._thread.quit()
-        self._thread.wait()
+        _stop_thread(self._thread)
         QMessageBox.critical(self._window, title, message)
         self._app.exit(1)
 
@@ -987,10 +995,8 @@ def main() -> None:
     local_config_store = LocalConfigStore(cache_dir / "local_config.json")
     system_config_store = SystemConfigStore(data_dir / "system_config.json")
 
-    thread = QThread()
     worker = _PreflightWorker(token_store, local_config_store, system_config_store)
-    worker.moveToThread(thread)
-    thread.started.connect(worker.run)
+    thread = _new_worker_thread(worker)
 
     # Kept alive via this local variable for main()'s lifetime (which lasts
     # until app.exec() returns) — Qt would otherwise garbage-collect an

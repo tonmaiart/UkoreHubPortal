@@ -32,10 +32,6 @@ class _DeviceFlowWorker(QObject):
 
     def run(self) -> None:
         try:
-            if not self._client_id:
-                raise GitHubAuthError(
-                    "GitHub Client ID not configured (data/system_config.json) — ask a studio admin."
-                )
             device = github_auth.request_device_code(self._client_id)
             self.code_ready.emit(device.user_code, device.verification_uri)
             token = github_auth.poll_for_token(
